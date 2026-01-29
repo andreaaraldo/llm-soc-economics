@@ -26,6 +26,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm
 import matplotlib.patches as mpatches
+from scipy.special import lambertw
+
 
 
 # ============================================================
@@ -53,7 +55,9 @@ VAR_LEVEL = 0.01   # Level of the value at risk
 
 theta_grid = np.linspace(0.01, 0.50, 40)
 theta_bins = np.array([0.05, 0.10, 0.20, 0.30, 0.40])
+theta_bins = np.array([0.10])
 CV_levels = [0.05, 0.25, 0.50, 1.00]
+CV_levels = [0.50]
 
 
 # ============================================================
@@ -82,7 +86,8 @@ GAMMA_MULT_BY_ROLE = {"L1": 0.8, "L2": 1.0, "L3": 1.3}
 
 
 # Minimum rework fraction in the limit of "lots of tokens" (paper: eta_rework^{min} in [0,0.5[)
-eta_rework_min_by_alert: dict[str, float] = {"low": 0.10, "med": 0.10, "high": 0.10}
+eta_work_min_scale = 0
+eta_rework_min_by_alert_type: dict[str, float] = {"low": 0.10*eta_work_min_scale, "med": 0.10*eta_work_min_scale, "high": 0.10*eta_work_min_scale}
 
 
 
@@ -178,6 +183,19 @@ def token_cost_eur(total_tokens: np.ndarray) -> np.ndarray:
     return c_tok_in_eur_per_token * in_tokens + c_tok_out_eur_per_token * out_tokens
 
 
+
+def c_tok_effective_eur_per_token() -> float:
+    """
+    Paper assumes a single constant c_tok.
+    With in/out pricing and fixed OUTPUT_TOKEN_SHARE, use the expected €/token.
+    """
+    if not USE_IN_OUT_PRICING:
+        return float(c_tok_eur_per_token)
+    return float((1.0 - OUTPUT_TOKEN_SHARE) * c_tok_in_eur_per_token
+                 + OUTPUT_TOKEN_SHARE * c_tok_out_eur_per_token)
+
+
+
 # ============================================================
 # UNITS: tau semantics
 # ============================================================
@@ -214,14 +232,8 @@ for a in ALERT_TYPES:
                 * TAU_NEW_MULT_BY_ROLE[r]
             )
 
-gamma_bar: dict[tuple[str, str, str], float] = {}
-for a in ALERT_TYPES:
-    for k in TASKS_NO_LLM:
-        for r in ROLES:
-            gamma_bar[(k, r, a)] = (
-                gamma_scale*
-                GAMMA_BASE_BY_TASK[k] * GAMMA_MULT_BY_ALERT[a] * GAMMA_MULT_BY_ROLE[r]
-            )
+# It will be filled with optimal values
+gamma_bar: dict[tuple[str, str, str], float] | None = None
 
 # ============================================================
 # DISTRIBUTIONS (mean + CV)
@@ -355,6 +367,7 @@ def sample_ROI_components(theta: float, cv: float, N: int) -> tuple[np.ndarray, 
 
 
 
+
 # ============================================================
 # REWORK MODEL (paper: Eq. rework-decreasing + g(.))
 #   tau_rework,k,r(a) = g(gamma_k,r(a)) * tau_noLLM,k,r(a)
@@ -367,11 +380,85 @@ def sample_ROI_components(theta: float, cv: float, N: int) -> tuple[np.ndarray, 
 xi_rework_tokens: dict[str, float] = dict(xi_tokens)
 
 def g_rework(gamma_tokens: np.ndarray, a: str) -> np.ndarray:
-    eta_min = float(eta_rework_min_by_alert[a])
+    eta_min = float(eta_rework_min_by_alert_type[a])
     xi = float(xi_rework_tokens[a])
     if xi <= 0:
         raise ValueError(f"xi_rework_tokens[{a}] must be > 0. Got {xi}.")
     return eta_min + (1.0 - eta_min) * np.exp(-gamma_tokens / xi)
+
+
+
+
+# ============================================================
+# MEAN-OPTIMAL TOKENS (paper Prop. optimal-gamma-kra)
+# ============================================================
+
+def build_gamma_bar_mean_optimal(
+    alert_types: list[str],
+    tasks_no_llm: list[str],
+    roles: list[str],
+    tau_bar_no_llm: dict[tuple[str, str, str], float],
+    cost_per_fte_day_eur: dict[str, float],
+    xi_tokens: dict[str, float],
+) -> dict[tuple[str, str, str], float]:
+    """
+    Builds mean-optimal gamma_bar according to paper Prop. optimal-gamma-kra:
+        gamma*_{k,r}(a) = xi[a] * W( (c_r * tau_noLLM_bar_{k,r}(a)) / (c_tok * xi[a]) )
+    where W is Lambert W (principal branch).
+    """
+    c_tok = c_tok_effective_eur_per_token()
+    if c_tok <= 0:
+        raise ValueError(f"c_tok must be > 0. Got {c_tok}.")
+
+    gamma_bar: dict[tuple[str, str, str], float] = {}
+
+    for a in alert_types:
+        xi = float(xi_tokens[a])
+        if xi <= 0:
+            raise ValueError(f"xi_tokens[{a}] must be > 0. Got {xi}.")
+
+        for k in tasks_no_llm:
+            for r in roles:
+                c_r = float(cost_per_fte_day_eur[r])          # €/FTE-day
+                tau0 = float(tau_bar_no_llm[(k, r, a)])       # your mean baseline tau
+
+                x = (c_r * tau0) / (c_tok * xi)
+                if x <= 0:
+                    gamma_star = 0.0
+                else:
+                    gamma_star = xi * float(lambertw(x).real)
+
+                gamma_bar[(k, r, a)] = float(max(gamma_star, 0.0))
+
+    return gamma_bar
+
+
+
+def gamma_bar_optimal_from_prop(k: str, r: str, a: str) -> float:
+    """
+    Mean-optimal token budget:
+      gamma* = xi[a] * W( (c_r * tau_bar_no_llm[k,r,a]) / (c_tok * xi[a]) )
+    Assumes the simplification xi_rework = xi (you already set xi_rework_tokens = xi_tokens).
+    """
+    xi = float(xi_tokens[a])
+    if xi <= 0:
+        raise ValueError(f"xi_tokens[{a}] must be > 0. Got {xi}.")
+
+    c_r = float(cost_per_fte_day_eur[r])                 # €/FTE-day
+    tau0 = float(tau_bar_no_llm[(k, r, a)])              # mean baseline τ (your units)
+    c_tok = float(c_tok_effective_eur_per_token())       # €/token (constant)
+
+    # x must be >= 0 for your setting
+    x = (c_r * tau0) / (c_tok * xi)
+    if x <= 0:
+        return 0.0
+
+    # lambertw returns complex in general; for x>0 it is real on principal branch
+    w = float(lambertw(x).real)
+    gamma_star = xi * w
+
+    # guard against numeric weirdness
+    return float(max(gamma_star, 0.0))
 
 
 
@@ -747,6 +834,16 @@ def plot_boxplots_tokens_per_task_alert_role(N: int | None = None) -> None:
 # ============================================================
 
 if __name__ == "__main__":
+
+    gamma_bar = build_gamma_bar_mean_optimal(
+        alert_types=ALERT_TYPES,
+        tasks_no_llm=TASKS_NO_LLM,
+        roles=ROLES,
+        tau_bar_no_llm=tau_bar_no_llm,
+        cost_per_fte_day_eur=cost_per_fte_day_eur,
+        xi_tokens=xi_tokens,
+    )
+    
     print_sanity(theta_ref=0.10, cv_ref=0.25, N=20_000)
     plot_eta_profile_vs_tokens()
     plot_boxplots_tokens_per_task_alert_role()
