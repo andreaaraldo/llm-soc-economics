@@ -69,7 +69,7 @@ TAU_MULT_BY_ROLE = {"L1": 1.0, "L2": 0.8, "L3": 0.4}
 
 # New-task mean effort (FTE-day) with multipliers
 fte_scale_new_tasks = 0.0002 # base mean FTE spent on a task
-TAU_NEW_BASE_BY_TASK = {"review": 0.01, "rework": 0.02, "prompting": 0.08}
+TAU_NEW_BASE_BY_TASK = {"review": 0.01, "prompting": 0.08}
 TAU_NEW_MULT_BY_ALERT = {"low": 1.0, "med": 2.0, "high": 5.0}
 TAU_NEW_MULT_BY_ROLE = {"L1": 0.6, "L2": 1.0, "L3": 1.2}
 
@@ -81,9 +81,13 @@ GAMMA_MULT_BY_ALERT = {"low": 1.0, "med": 1.6, "high": 2.4}
 GAMMA_MULT_BY_ROLE = {"L1": 0.8, "L2": 1.0, "L3": 1.3}
 
 
+# Minimum rework fraction in the limit of "lots of tokens" (paper: eta_rework^{min} in [0,0.5[)
+eta_rework_min_by_alert: dict[str, float] = {"low": 0.10, "med": 0.10, "high": 0.10}
+
+
 
 # ============================================================
-# EQ.13 PARAMETER xi[a] (tokens per alert)
+# tokens per alert
 # ============================================================
 xi_tokens_scale = gamma_scale
 xi_tokens: dict[str, float] = {"low": 1.5*xi_tokens_scale, \
@@ -100,6 +104,12 @@ N_SAMPLES_BOXPLOT = N_SAMPLES_MAIN
 
 USE_LOG_Y_FOR_PROB = False
 PROB_LOG_EPS_PERCENT = 1e-6
+
+
+
+
+
+
 
 
 
@@ -130,7 +140,7 @@ def save_figure(fig_name: str) -> None:
 ALERT_TYPES = ["low", "med", "high"]          # a ∈ A
 ROLES = ["L1", "L2", "L3"]                    # r ∈ R
 TASKS_NO_LLM = ["triage", "analysis", "reporting"]  # k ∈ K
-TASKS_NEW = ["review", "rework", "prompting"]       # k ∈ K_new
+TASKS_NEW_EXCEPT_REWORK = ["review", "prompting"]       # k ∈ K_new
 
 
 HOURS_PER_DAY = 8.0
@@ -195,7 +205,7 @@ for a in ALERT_TYPES:
 
 tau_new_bar: dict[tuple[str, str, str], float] = {}
 for a in ALERT_TYPES:
-    for k in TASKS_NEW:
+    for k in TASKS_NEW_EXCEPT_REWORK:
         for r in ROLES:
             tau_new_bar[(k, r, a)] = (
                 fte_scale_new_tasks
@@ -271,11 +281,15 @@ def sample_ROI_components(theta: float, cv: float, N: int) -> tuple[np.ndarray, 
     gamma_samples: dict[tuple[str, str, str], np.ndarray] = {}
     eta_samples: dict[tuple[str, str, str], np.ndarray] = {}
 
-    for (k, r, a), g_mean in gamma_bar.items():
-        shape_g, scale_g = gamma_params_from_mean_cv(g_mean, cv)
+
+    # Tokens for existing tasks
+    for (k, r, a), gamma_mean in gamma_bar.items():
+        shape_g, scale_g = gamma_params_from_mean_cv(gamma_mean, cv)
         gamma_samples[(k, r, a)] = rng.gamma(shape=shape_g, scale=scale_g, size=N)
 
-        eta_mean = eta_bar_from_eq13(gamma_mean=g_mean, xi_a=xi_tokens[a])
+    # Productivity gain for existing tasks
+    for (k, r, a), gamma_mean in gamma_bar.items():
+        eta_mean = eta_bar_from_eq13(gamma_mean=gamma_mean, xi_a=xi_tokens[a])
         alpha, beta = beta_params_from_mean_cv(eta_mean, cv)
         eta_samples[(k, r, a)] = rng.beta(alpha, beta, size=N)
 
@@ -285,11 +299,28 @@ def sample_ROI_components(theta: float, cv: float, N: int) -> tuple[np.ndarray, 
         shape_t, scale_t = gamma_params_from_mean_cv(t_mean, cv)
         tau_new_samples[key] = rng.gamma(shape=shape_t, scale=scale_t, size=N)
 
-    baseline_personnel = C_noLLM - C_inv_eur_per_day
+    # Daily operational cost for the security-related operations
+    C_op_nollm = C_noLLM - C_inv_eur_per_day
 
-    llm_personnel_existing = np.zeros(N, dtype=float)
-    llm_personnel_new = np.zeros(N, dtype=float)
+    cost_of_personnel_with_llm_on_preexisting_tasks = np.zeros(N, dtype=float)
+    cost_of_personnel_to_execute_new_tasks = np.zeros(N, dtype=float)
+    cost_of_rework = np.zeros(N, dtype=float)
     token_cost_total = np.zeros(N, dtype=float)
+
+    # --- REWORK: endogenous function of tokens (paper) ---
+    # Sum over original tasks k in K_noLLM:
+    #   tau_rework,r(a) = sum_k g(gamma_k,r(a)) * tau_noLLM,k,r(a)
+    # Costed as additional new-task effort.
+    for a in ALERT_TYPES:
+        mult = volume_multiplier(a)
+        for r in ROLES:
+            tau_rework_r_a = np.zeros(N, dtype=float)
+            for k in TASKS_NO_LLM:
+                key = (k, r, a)
+                tau0 = tau_bar_no_llm[key] * mult
+                tau_rework_r_a += g_rework(gamma_samples[key], a) * tau0
+                cost_of_rework += cost_per_fte_day_eur[r] * tau_rework_r_a
+
 
     for a in ALERT_TYPES:
         mult = volume_multiplier(a)
@@ -299,24 +330,51 @@ def sample_ROI_components(theta: float, cv: float, N: int) -> tuple[np.ndarray, 
             for r in ROLES:
                 key = (k, r, a)
                 tau_component = tau_bar_no_llm[key] * mult
-                llm_personnel_existing += cost_per_fte_day_eur[r] * tau_component * (1.0 - eta_samples[key])
+                cost_of_personnel_with_llm_on_preexisting_tasks += cost_per_fte_day_eur[r] * tau_component * (1.0 - eta_samples[key])
                 token_cost_total += token_cost_eur(gamma_samples[key] * n_a)
 
-        for k in TASKS_NEW:
+        for k in TASKS_NEW_EXCEPT_REWORK:
             for r in ROLES:
                 key = (k, r, a)
                 tau_new_component = tau_new_samples[key] * mult
-                llm_personnel_new += cost_per_fte_day_eur[r] * tau_new_component
+                cost_of_personnel_to_execute_new_tasks += cost_per_fte_day_eur[r] * tau_new_component
+                # to complete the computation of cost_of_personnel_to_execute_new_tasks
+                # we have to also add the cost of rework
 
-    Delta_eff = baseline_personnel - llm_personnel_existing
+    cost_of_personnel_to_execute_new_tasks += cost_of_rework
+
+    Delta_eff = C_op_nollm - cost_of_personnel_with_llm_on_preexisting_tasks
     Beta_tok = token_cost_total
-    Beta_new = llm_personnel_new
+    Beta_new = cost_of_personnel_to_execute_new_tasks
     DeltaC = Delta_eff - Beta_tok - Beta_new
 
     C_cap = theta * C_noLLM
     ROI = (DeltaC - C_cap) / max(C_cap, 1e-12)
 
     return ROI, DeltaC, Delta_eff, Beta_tok, Beta_new
+
+
+
+# ============================================================
+# REWORK MODEL (paper: Eq. rework-decreasing + g(.))
+#   tau_rework,k,r(a) = g(gamma_k,r(a)) * tau_noLLM,k,r(a)
+#   g(gamma) = eta_rework_min + (1-eta_rework_min)*exp(-gamma/xi_rework)
+# ============================================================
+
+
+# Rework decay scale (paper: xi_rework). If you adopt the simplifying assumption xi_rework = xi (Prop. simplification),
+# reuse the same xi_tokens[a].
+xi_rework_tokens: dict[str, float] = dict(xi_tokens)
+
+def g_rework(gamma_tokens: np.ndarray, a: str) -> np.ndarray:
+    eta_min = float(eta_rework_min_by_alert[a])
+    xi = float(xi_rework_tokens[a])
+    if xi <= 0:
+        raise ValueError(f"xi_rework_tokens[{a}] must be > 0. Got {xi}.")
+    return eta_min + (1.0 - eta_min) * np.exp(-gamma_tokens / xi)
+
+
+
 
 
 # ============================================================
@@ -656,8 +714,8 @@ def plot_boxplots_tokens_per_task_alert_role(N: int | None = None) -> None:
     for cv in CV_levels:
         # --- sample gamma for all triples once per CV ---
         gamma_samples: dict[tuple[str, str, str], np.ndarray] = {}
-        for (k, r, a), g_mean in gamma_bar.items():
-            shape_g, scale_g = gamma_params_from_mean_cv(g_mean, cv)
+        for (k, r, a), gamma_mean in gamma_bar.items():
+            shape_g, scale_g = gamma_params_from_mean_cv(gamma_mean, cv)
             gamma_samples[(k, r, a)] = rng.gamma(shape=shape_g, scale=scale_g, size=N)
 
         # --- one plot per alert type (a) for readability ---
