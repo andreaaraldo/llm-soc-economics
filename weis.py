@@ -35,20 +35,16 @@ import matplotlib.patches as mpatches
 RANDOM_SEED = 7
 rng = np.random.default_rng(RANDOM_SEED)
 
-fte_newtask_scale = 0.02 # average FTE spent on each new task
-num_of_alert_scale=0.2
+eta_max = 0.9 # maximum productivity gain achievable via the LLM
 
 FIG_FORMAT = "png"   # best for plots with text
 FIG_DPI = 150        # lighter than 300
 FIG_FACE = "white"
 
+alert_scale=1
+alert_proportion = {"low": 0.75, "med": 0.2, "high": 0.05}  
 
-# ============================================================
-# EQ.13 PARAMETER xi[a] (tokens per alert)
-# ============================================================
-xi_tokens_scale = 1
-xi_tokens: dict[str, float] = {"low": 20000.0*xi_tokens_scale, \
-"med": 15000.0*xi_tokens_scale, "high": 10000.0*xi_tokens_scale}
+VAR_LEVEL = 0.01   # Level of the value at risk
 
 
 # ============================================================
@@ -61,7 +57,42 @@ CV_levels = [0.05, 0.25, 0.50, 1.00]
 
 
 # ============================================================
-# MONTE CARLO SIZES
+# SETTING MEAN PARAMETERS
+# ============================================================
+
+
+# Base mean FTE-day per (task) for each alert type multiplier and role multiplier
+fte_scale_old_tasks = 0.02 # base mean FTE spent on a task
+TAU_BASE_BY_TASK = {"triage": 0.15, "analysis": 0.6, "reporting": 0.25}
+TAU_MULT_BY_ALERT = {"low": 1.0, "med": 1.8, "high": 4.0}
+TAU_MULT_BY_ROLE = {"L1": 1.0, "L2": 0.8, "L3": 0.4}
+
+# New-task mean effort (FTE-day) with multipliers
+fte_scale_new_tasks = 0.0002 # base mean FTE spent on a task
+TAU_NEW_BASE_BY_TASK = {"review": 0.01, "rework": 0.02, "prompting": 0.08}
+TAU_NEW_MULT_BY_ALERT = {"low": 1.0, "med": 2.0, "high": 5.0}
+TAU_NEW_MULT_BY_ROLE = {"L1": 0.6, "L2": 1.0, "L3": 1.2}
+
+
+gamma_scale = 1200 # base mean tokens spent on a task
+# Base mean tokens per (task) with alert/role multipliers
+GAMMA_BASE_BY_TASK = {"triage": 0.14, "analysis": 0.55, "reporting": 0.31} #Fraction of tokens spent
+GAMMA_MULT_BY_ALERT = {"low": 1.0, "med": 1.6, "high": 2.4}
+GAMMA_MULT_BY_ROLE = {"L1": 0.8, "L2": 1.0, "L3": 1.3}
+
+
+
+# ============================================================
+# EQ.13 PARAMETER xi[a] (tokens per alert)
+# ============================================================
+xi_tokens_scale = gamma_scale
+xi_tokens: dict[str, float] = {"low": 1.5*xi_tokens_scale, \
+"med": 1.0*xi_tokens_scale, "high": 0.5*xi_tokens_scale}
+
+
+
+# ============================================================
+# MONTE CARLO SIMULATION SETTINGS
 # ============================================================
 
 N_SAMPLES_MAIN = 500
@@ -72,6 +103,10 @@ PROB_LOG_EPS_PERCENT = 1e-6
 
 
 
+
+# ============================================================
+# FROM THIS POINT ONWARD YOU DON'T NEED TO CARE
+# ============================================================
 
 def get_script_dir() -> Path:
     try:
@@ -97,8 +132,6 @@ ROLES = ["L1", "L2", "L3"]                    # r ∈ R
 TASKS_NO_LLM = ["triage", "analysis", "reporting"]  # k ∈ K
 TASKS_NEW = ["review", "rework", "prompting"]       # k ∈ K_new
 
-
-alerts_per_day = {"low": 120.0*num_of_alert_scale, "med": 35.0*num_of_alert_scale, "high": 8.0*num_of_alert_scale}   # n_a (alerts/day)
 
 HOURS_PER_DAY = 8.0
 hourly_cost_eur = {"L1": 45.0, "L2": 70.0, "L3": 110.0}
@@ -144,41 +177,41 @@ TAU_IS_FTE_PER_ALERT = False
 # If you calibrate tau as "per alert", set True and tau will be multiplied by n_a.
 
 def volume_multiplier(a: str) -> float:
-    return float(alerts_per_day[a]) if TAU_IS_FTE_PER_ALERT else 1.0
-
+    return float(alert_proportion[a]) if TAU_IS_FTE_PER_ALERT else 1.0
 
 # ============================================================
-# MEAN PARAMETERS (paper inputs)
+# SETTING MEAN PARAMETERS
 # ============================================================
+
 
 tau_bar_no_llm: dict[tuple[str, str, str], float] = {}
 for a in ALERT_TYPES:
     for k in TASKS_NO_LLM:
         for r in ROLES:
-            base = {"triage": 0.002, "analysis": 0.006, "reporting": 0.003}[k]
-            mult_a = {"low": 1.0, "med": 1.8, "high": 4.0}[a]
-            mult_r = {"L1": 1.0, "L2": 0.8, "L3": 0.4}[r]
-            tau_bar_no_llm[(k, r, a)] = base * mult_a * mult_r
-
-gamma_bar: dict[tuple[str, str, str], float] = {}
-for a in ALERT_TYPES:
-    for k in TASKS_NO_LLM:
-        for r in ROLES:
-            base = {"triage": 300, "analysis": 1200, "reporting": 700}[k]
-            mult_a = {"low": 1.0, "med": 1.6, "high": 2.4}[a]
-            mult_r = {"L1": 0.8, "L2": 1.0, "L3": 1.3}[r]
-            gamma_bar[(k, r, a)] = base * mult_a * mult_r
+            tau_bar_no_llm[(k, r, a)] = (
+                fte_scale_old_tasks
+                *TAU_BASE_BY_TASK[k] * TAU_MULT_BY_ALERT[a] * TAU_MULT_BY_ROLE[r]
+            )
 
 tau_new_bar: dict[tuple[str, str, str], float] = {}
 for a in ALERT_TYPES:
     for k in TASKS_NEW:
         for r in ROLES:
-            base = {"review": 0.0015, "rework": 0.0020, "prompting": 0.0008}[k]
-            mult_a = {"low": 1.0, "med": 2.0, "high": 5.0}[a]
-            mult_r = {"L1": 0.6, "L2": 1.0, "L3": 1.2}[r]
-            tau_new_bar[(k, r, a)] = fte_newtask_scale * base * mult_a * mult_r
+            tau_new_bar[(k, r, a)] = (
+                fte_scale_new_tasks
+                * TAU_NEW_BASE_BY_TASK[k]
+                * TAU_NEW_MULT_BY_ALERT[a]
+                * TAU_NEW_MULT_BY_ROLE[r]
+            )
 
-
+gamma_bar: dict[tuple[str, str, str], float] = {}
+for a in ALERT_TYPES:
+    for k in TASKS_NO_LLM:
+        for r in ROLES:
+            gamma_bar[(k, r, a)] = (
+                gamma_scale*
+                GAMMA_BASE_BY_TASK[k] * GAMMA_MULT_BY_ALERT[a] * GAMMA_MULT_BY_ROLE[r]
+            )
 
 # ============================================================
 # DISTRIBUTIONS (mean + CV)
@@ -204,7 +237,7 @@ def gamma_params_from_mean_cv(mean: float, cv: float) -> tuple[float, float]:
 def eta_bar_from_eq13(gamma_mean: float, xi_a: float) -> float:
     if xi_a <= 0:
         raise ValueError(f"xi[a] must be > 0. Got {xi_a}.")
-    eta = 1.0 - math.exp(-float(gamma_mean) / float(xi_a))
+    eta = eta_max * (1.0 - math.exp(-float(gamma_mean) / float(xi_a)) )
     return float(np.clip(eta, 1e-6, 1.0 - 1e-6))
 
 
@@ -260,7 +293,7 @@ def sample_ROI_components(theta: float, cv: float, N: int) -> tuple[np.ndarray, 
 
     for a in ALERT_TYPES:
         mult = volume_multiplier(a)
-        n_a = float(alerts_per_day[a])
+        n_a = float(alert_proportion[a])
 
         for k in TASKS_NO_LLM:
             for r in ROLES:
@@ -345,13 +378,17 @@ def plot_profitability_probability() -> None:
 # FIG.2: Chessboard VaR_5%(ROI) classes
 # ============================================================
 
-def plot_chessboard_var5() -> None:
+def plot_chessboard_var_roi(var_level: float = 0.05) -> None:
+    if not (0.0 < var_level < 1.0):
+        raise ValueError("var_level must be in (0,1).")
+
     V = np.zeros((len(CV_levels), len(theta_bins)), dtype=float)
 
     for i, cv in enumerate(CV_levels):
         for j, theta in enumerate(theta_bins):
             ROI, *_ = sample_ROI_components(theta=theta, cv=cv, N=N_SAMPLES_MAIN)
-            V[i, j] = -np.quantile(ROI, 0.05) * 100.0
+            # VaR_z(ROI) = -quantile_z(ROI), expressed in %
+            V[i, j] = -np.quantile(ROI, var_level) * 100.0
 
     bounds = [0, 5, 10, 30, 50, 1e9]
     cmap = ListedColormap(["white", "0.85", "0.70", "0.45", "0.15"])
@@ -363,7 +400,9 @@ def plot_chessboard_var5() -> None:
     plt.yticks(np.arange(len(CV_levels)), [f"CV={cv}" for cv in CV_levels])
     plt.xlabel(r"$\theta$")
     plt.ylabel("Uncertainty level (CV)")
-    plt.title(r"Chessboard: $VaR_{5\%}(ROI)$ classes (in %)")
+
+    z_pct = int(round(var_level * 100))
+    plt.title(rf"Chessboard: $VaR_{{{z_pct}\%}}(ROI)$ classes (in %)")
 
     ax = plt.gca()
     ax.set_xticks(np.arange(-.5, len(theta_bins), 1), minor=True)
@@ -373,11 +412,19 @@ def plot_chessboard_var5() -> None:
 
     labels = ["0–5%", "5–10%", "10–30%", "30–50%", ">50%"]
     patches = [mpatches.Patch(color=cmap(i), label=labels[i]) for i in range(cmap.N)]
-    plt.legend(handles=patches, title=r"$VaR_{5\%}(ROI)$", loc="upper left", bbox_to_anchor=(1.02, 1.0))
+    plt.legend(
+        handles=patches,
+        title=rf"$VaR_{{{z_pct}\%}}(ROI)$",
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1.0),
+    )
 
     plt.tight_layout()
-    save_figure("fig2_chessboard_var5_roi")
+    save_figure(f"fig_chessboard_var_roi_{z_pct}pct")
     plt.show()
+
+
+
 
 # ============================================================
 # FIG.NEW: Boxplots of DeltaC components per (theta, CV)
@@ -566,12 +613,86 @@ def plot_boxplot_DeltaC_vs_Ccap_vs_CnoLLM() -> None:
 
 
 # ============================================================
+# FIG.NEW: eta profile vs tokens (Eq.13 mean link)
+#   eta_bar(gamma) = eta_max * (1 - exp(-gamma/xi[a]))
+# ============================================================
+
+def plot_eta_profile_vs_tokens() -> None:
+    # Pick a token range that covers your configured gamma means (and beyond)
+    gamma_means = np.array(list(gamma_bar.values()), dtype=float)
+    g_min = max(0.0, float(np.min(gamma_means)) * 0.0)   # start at 0
+    g_max = float(np.max(gamma_means)) * 3.0            # extend beyond observed means
+    g = np.linspace(g_min, max(g_max, 1.0), 400)
+
+    plt.figure()
+
+    # One curve per alert type (because xi depends on a)
+    for a in ALERT_TYPES:
+        y = np.array([eta_bar_from_eq13(gamma_mean=gi, xi_a=xi_tokens[a]) for gi in g], dtype=float)
+        plt.plot(g, y, label=fr"{a} (xi={xi_tokens[a]:.0f})")
+
+    # Also show where your configured gamma means lie (optional but useful)
+    plt.scatter(gamma_means, [0.0] * len(gamma_means), marker="|", linewidths=2)
+
+    plt.xlabel(r"Mean tokens $\bar{\gamma}$")
+    plt.ylabel(r"Mean efficiency $\bar{\eta}$")
+    plt.title(r"Eq.13 mean link: $\bar{\eta}=\eta_{\max}(1-e^{-\bar{\gamma}/\xi[a]})$")
+    plt.ylim(0.0, min(1.0, eta_max * 1.05))
+    plt.legend()
+    plt.tight_layout()
+    save_figure("fig_eta_profile_vs_tokens")
+    plt.show()
+
+
+# ============================================================
+# FIG.NEW: Boxplots of tokens per (task, alert type, role)
+#   For each a: boxplot of gamma_{k,r}(a) (tokens per query / per unit as modeled)
+# ============================================================
+
+def plot_boxplots_tokens_per_task_alert_role(N: int | None = None) -> None:
+    if N is None:
+        N = N_SAMPLES_BOXPLOT
+
+    for cv in CV_levels:
+        # --- sample gamma for all triples once per CV ---
+        gamma_samples: dict[tuple[str, str, str], np.ndarray] = {}
+        for (k, r, a), g_mean in gamma_bar.items():
+            shape_g, scale_g = gamma_params_from_mean_cv(g_mean, cv)
+            gamma_samples[(k, r, a)] = rng.gamma(shape=shape_g, scale=scale_g, size=N)
+
+        # --- one plot per alert type (a) for readability ---
+        for a in ALERT_TYPES:
+            data = []
+            labels = []
+
+            # consistent ordering: task then role
+            for k in TASKS_NO_LLM:
+                for r in ROLES:
+                    key = (k, r, a)
+                    data.append(gamma_samples[key])
+                    labels.append(f"{k}-{r}")
+
+            plt.figure(figsize=(max(10, 0.6 * len(labels)), 5))
+            plt.boxplot(data, labels=labels, showfliers=False, whis=(5, 95))
+            plt.xticks(rotation=45, ha="right")
+            plt.ylabel("Tokens (per sampled γ)")
+            plt.title(f"Tokens distribution per (task, role) — alert={a}, CV={cv}, N={N}")
+            plt.tight_layout()
+
+            save_figure(f"box_tokens_task_role_alert_{a}_cv_{str(cv).replace('.', 'p')}")
+            plt.show()
+
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
 if __name__ == "__main__":
     print_sanity(theta_ref=0.10, cv_ref=0.25, N=20_000)
-    plot_chessboard_var5()
+    plot_eta_profile_vs_tokens()
+    plot_boxplots_tokens_per_task_alert_role()
+    plot_chessboard_var_roi(VAR_LEVEL) 
     plot_boxplot_DeltaC_vs_Ccap_vs_CnoLLM()
     plot_profitability_probability()
     plot_boxplots_deltaC_components_per_config()
